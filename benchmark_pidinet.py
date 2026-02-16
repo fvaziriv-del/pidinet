@@ -1,7 +1,7 @@
 """
-PiDiNet Benchmark - کار می‌کنه با همه checkpoint ها!
-====================================================
-Based on actual repo code - tested and working!
+PiDiNet Benchmark - Based on throughput.py from the repo
+=========================================================
+No conversion - direct benchmarking like the official throughput.py
 """
 
 import torch
@@ -14,15 +14,18 @@ from tqdm.auto import tqdm
 
 
 def remove_module_prefix(state_dict):
-    """Remove 'module.' from DataParallel checkpoints"""
-    new = {}
-    for k, v in state_dict.items():
-        new[k[7:] if k.startswith('module.') else k] = v
-    return new
+    """Remove module. prefix from DataParallel"""
+    return {k[7:] if k.startswith('module.') else k: v for k, v in state_dict.items()}
 
 
 class PiDiNetBenchmarker:
     def __init__(self, model_type='tiny', precision='fp16', checkpoint_path=None):
+        """
+        Args:
+            model_type: 'tiny' (no sa/dil), 'small' (sa/dil), 'full' (sa/dil)
+            precision: 'fp16' or 'fp32'
+            checkpoint_path: .pth file
+        """
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         if self.device.type != 'cuda':
             raise RuntimeError("GPU required!")
@@ -30,41 +33,49 @@ class PiDiNetBenchmarker:
         self.model_type = model_type
         self.precision = precision
         
-        print(f"Loading {model_type} model...")
+        print(f"Creating {model_type} model...")
         
         # Import
         import models
-        from models.convert_pidinet import convert_pidinet
         
-        # Args
+        # Create args (like throughput.py and main.py do)
         class Args:
-            pass
-        args = Args()
-        args.config = 'carv4'
-        args.sa = model_type != 'tiny'  # tiny: False, others: True
-        args.dil = model_type != 'tiny'
+            config = 'carv4'
+            sa = model_type in ['small', 'full']  # tiny: False, others: True
+            dil = model_type in ['small', 'full']
         
-        print(f"  Config: {args.config}, SA: {args.sa}, DIL: {args.dil}")
+        args = Args()
+        print(f"  config={args.config}, sa={args.sa}, dil={args.dil}")
+        
+        # Map to actual model names in models/__dict__
+        # Based on scripts.sh:
+        # - pidinet (with --sa --dil for full)
+        # - pidinet (without --sa --dil for tiny)  
+        # - pidinet_small (with --sa --dil)
+        
+        if model_type == 'tiny':
+            model_name = 'pidinet'  # No SA/DIL
+        elif model_type == 'small':
+            model_name = 'pidinet_small'  # With SA/DIL
+        else:  # full
+            model_name = 'pidinet'  # With SA/DIL
         
         # Create model
-        model_fn = models.__dict__['pidinet']
+        model_fn = models.__dict__[model_name]
         model = model_fn(args)
         
         # Load checkpoint
         if checkpoint_path:
-            print(f"  Loading: {checkpoint_path}")
+            print(f"  Loading {checkpoint_path}...")
             ckpt = torch.load(checkpoint_path, map_location='cpu')
             state = ckpt.get('state_dict', ckpt)
             state = remove_module_prefix(state)
             model.load_state_dict(state)
             print("  ✓ Loaded")
         
-        # Convert: pass model.state_dict(), NOT model!
-        print("  Converting...")
-        converted_state = convert_pidinet(model.state_dict(), args.config)
+        # NO CONVERSION - use original PDC model for benchmarking!
+        # (conversion is only for deployment/ONNX export)
         
-        # Load converted weights back to model
-        model.load_state_dict(converted_state)
         self.model = model
         
         # Precision
@@ -73,7 +84,7 @@ class PiDiNetBenchmarker:
         
         self.model.to(self.device).eval()
         self.num_params = sum(p.numel() for p in self.model.parameters())
-        print(f"✓ Ready! {self.num_params:,} params\n")
+        print(f"✓ Model ready: {self.num_params:,} params\n")
         
         # Transform
         self.transform = transforms.Compose([
@@ -84,7 +95,7 @@ class PiDiNetBenchmarker:
     def benchmark_folder(self, folder, warmup=20, iters=100, save_log=True):
         """Benchmark on folder"""
         
-        # Find images
+        # Load images
         files = []
         for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.PNG']:
             files.extend(glob.glob(f"{folder}/{ext}"))
@@ -94,6 +105,7 @@ class PiDiNetBenchmarker:
         
         print(f"Loading {len(files)} images...")
         tensors, sizes = [], []
+        
         for f in tqdm(files):
             try:
                 img = Image.open(f).convert('RGB')
