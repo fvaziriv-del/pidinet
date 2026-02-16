@@ -1,13 +1,11 @@
 """
-Simple PiDiNet Benchmarker - FIXED VERSION
-Just copy and run this in your notebook or save as .py file
+Universal PiDiNet Benchmarker - Works with ANY signature!
+Just paste this in your notebook
 """
 
 import torch
-import torch.nn as nn
 import glob
 import numpy as np
-from datetime import datetime
 from PIL import Image
 import torchvision.transforms as transforms
 from itertools import cycle
@@ -23,43 +21,65 @@ class PiDiNetBenchmarker:
         self.model_type = model_type
         self.precision = precision
         
-        # Import models
+        print(f"Loading {model_type} model...")
+        
+        # Import
         import models
         from models.convert_pidinet import convert_pidinet
         
-        # Model configs
-        configs = {
-            'tiny': {'sa': False, 'dil': False},
-            'small': {'sa': True, 'dil': True},
-            'full': {'sa': True, 'dil': True},
+        # Map model_type to actual model name in the repo
+        model_map = {
+            'tiny': 'pidinet',        # tiny is just pidinet without --sa --dil
+            'small': 'pidinet_small', # small uses pidinet_small
+            'full': 'pidinet',        # full is pidinet with --sa --dil
         }
-        cfg = configs[model_type]
         
-        print(f"Creating {model_type} model (SA={cfg['sa']}, DIL={cfg['dil']})...")
+        model_name = model_map[model_type]
         
-        # Create model - FIXED: Use models.__dict__ not direct import
-        pidinet_fn = models.__dict__['pidinet']
-        raw_model = pidinet_fn(sa=cfg['sa'], dil=cfg['dil'])
+        # Create model using the same way main.py does it
+        # main.py line ~230: model = models.__dict__[args.model](args)
+        # So the model takes args object!
+        
+        # Create a fake args object
+        class Args:
+            pass
+        
+        args = Args()
+        args.config = 'carv4'
+        
+        # Set sa and dil based on model_type
+        if model_type == 'tiny':
+            args.sa = False
+            args.dil = False
+        else:  # small or full
+            args.sa = True
+            args.dil = True
+        
+        # Get model function
+        model_fn = models.__dict__[model_name]
+        
+        # Create model - it takes args object
+        print(f"  Model: {model_name}, config: {args.config}, sa: {args.sa}, dil: {args.dil}")
+        raw_model = model_fn(args)
         
         # Load checkpoint
         if checkpoint_path:
-            print(f"Loading {checkpoint_path}...")
+            print(f"  Loading checkpoint...")
             ckpt = torch.load(checkpoint_path, map_location='cpu')
             state = ckpt.get('state_dict', ckpt)
             raw_model.load_state_dict(state)
         
-        # Convert PDC layers
-        print("Converting model...")
-        self.model = convert_pidinet(raw_model, 'carv4')
+        # Convert
+        print("  Converting...")
+        self.model = convert_pidinet(raw_model, args.config)
         
-        # Set precision
+        # Precision
         if precision == 'fp16':
             self.model = self.model.half()
         
         self.model.to(self.device).eval()
         self.num_params = sum(p.numel() for p in self.model.parameters())
-        
-        print(f"Ready! {self.num_params:,} parameters\n")
+        print(f"✓ Ready! {self.num_params:,} params\n")
         
         # Transform
         self.transform = transforms.Compose([
@@ -68,19 +88,15 @@ class PiDiNetBenchmarker:
         ])
     
     def benchmark_folder(self, folder, warmup=20, iters=100):
-        """Benchmark on folder of images"""
+        """Benchmark on images"""
         
-        # Load images
+        # Load
         files = []
         for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPG', '*.PNG']:
             files.extend(glob.glob(f"{folder}/{ext}"))
         
-        if not files:
-            raise FileNotFoundError(f"No images in {folder}")
-        
         print(f"Loading {len(files)} images...")
-        tensors = []
-        sizes = []
+        tensors, sizes = [], []
         
         for f in tqdm(files):
             img = Image.open(f).convert('RGB')
@@ -90,113 +106,95 @@ class PiDiNetBenchmarker:
                 t = t.half()
             tensors.append(t)
         
-        data_pool = cycle(tensors)
+        data = cycle(tensors)
         
         # Warmup
-        print(f"Warmup ({warmup} iters)...")
+        print(f"Warmup...")
         with torch.no_grad():
             for _ in range(warmup):
-                self.model(next(data_pool).to(self.device))
+                self.model(next(data).to(self.device))
         torch.cuda.synchronize()
         
         # Benchmark
-        print(f"Benchmarking ({iters} iters)...")
+        print(f"Benchmarking...")
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         
-        starter = torch.cuda.Event(enable_timing=True)
-        ender = torch.cuda.Event(enable_timing=True)
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
         times = []
         
         with torch.no_grad():
             for _ in tqdm(range(iters)):
-                inp = next(data_pool).to(self.device)
-                starter.record()
+                inp = next(data).to(self.device)
+                s.record()
                 self.model(inp)
-                ender.record()
+                e.record()
                 torch.cuda.synchronize()
-                times.append(starter.elapsed_time(ender))
+                times.append(s.elapsed_time(e))
         
-        # Stats
-        avg_lat = np.mean(times)
-        std_lat = np.std(times)
-        p95_lat = np.percentile(times, 95)
-        fps = 1000 / avg_lat
+        # Results
+        lat = np.mean(times)
+        std = np.std(times)
+        p95 = np.percentile(times, 95)
+        fps = 1000 / lat
         vram = torch.cuda.max_memory_allocated() / 1024**2
         
-        avg_w = int(np.mean([s[0] for s in sizes]))
-        avg_h = int(np.mean([s[1] for s in sizes]))
+        w = int(np.mean([s[0] for s in sizes]))
+        h = int(np.mean([s[1] for s in sizes]))
         
-        # Print results
         print(f"\n{'='*60}")
-        print(f"RESULTS: {self.model_type.upper()} - {self.precision.upper()}")
+        print(f"{self.model_type.upper()} - {self.precision.upper()}")
         print(f"{'='*60}")
-        print(f"Images:      {len(files)} ({avg_w}×{avg_h} avg)")
-        print(f"Latency:     {avg_lat:.2f} ± {std_lat:.2f} ms")
-        print(f"P95:         {p95_lat:.2f} ms")
-        print(f"FPS:         {fps:.2f}")
-        print(f"VRAM:        {vram:.2f} MB")
-        print(f"Parameters:  {self.num_params:,}")
+        print(f"Images:    {len(files)} ({w}×{h})")
+        print(f"Latency:   {lat:.2f} ± {std:.2f} ms (p95: {p95:.2f})")
+        print(f"FPS:       {fps:.2f}")
+        print(f"VRAM:      {vram:.2f} MB")
+        print(f"Params:    {self.num_params:,}")
         print(f"{'='*60}\n")
         
-        return {
-            'latency_ms': avg_lat,
-            'std_ms': std_lat,
-            'p95_ms': p95_lat,
-            'fps': fps,
-            'vram_mb': vram
-        }
+        return {'latency': lat, 'fps': fps, 'vram': vram}
     
-    def stress_test(self, image_path, resolutions=None):
-        """Test at different resolutions"""
+    def stress_test(self, image, resolutions=None):
+        """Stress test"""
         
         if resolutions is None:
-            resolutions = [1024, 2048, 4096, 8192]
+            resolutions = [1024, 2048, 4096]
         
-        img = Image.open(image_path).convert('RGB')
-        
-        print(f"\n{'='*60}")
-        print(f"STRESS TEST: {self.model_type.upper()}")
-        print(f"{'='*60}\n")
-        
-        results = []
+        img = Image.open(image).convert('RGB')
+        print(f"\nStress Test: {self.model_type.upper()}\n{'-'*40}")
         
         for size in resolutions:
             try:
-                print(f"Testing {size}×{size}...", end=' ')
+                print(f"{size}×{size}...", end=' ')
                 
-                resized = img.resize((size, size))
-                t = self.transform(resized).unsqueeze(0).to(self.device)
+                t = self.transform(img.resize((size, size))).unsqueeze(0).to(self.device)
                 if self.precision == 'fp16':
                     t = t.half()
                 
-                # Warmup
                 with torch.no_grad():
                     for _ in range(5):
                         self.model(t)
                 torch.cuda.synchronize()
                 
-                # Measure
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats()
                 
-                starter = torch.cuda.Event(enable_timing=True)
-                ender = torch.cuda.Event(enable_timing=True)
+                s = torch.cuda.Event(enable_timing=True)
+                e = torch.cuda.Event(enable_timing=True)
                 times = []
                 
                 with torch.no_grad():
                     for _ in range(20):
-                        starter.record()
+                        s.record()
                         self.model(t)
-                        ender.record()
+                        e.record()
                         torch.cuda.synchronize()
-                        times.append(starter.elapsed_time(ender))
+                        times.append(s.elapsed_time(e))
                 
                 lat = np.mean(times)
                 vram = torch.cuda.max_memory_allocated() / 1024**2
-                
-                print(f"✓ {lat:.2f} ms | {vram:.2f} MB")
-                results.append({'resolution': size, 'latency_ms': lat, 'vram_mb': vram})
+                print(f"✓ {lat:.1f}ms, {vram:.0f}MB")
                 
             except RuntimeError as e:
                 if 'out of memory' in str(e).lower():
@@ -204,42 +202,34 @@ class PiDiNetBenchmarker:
                     torch.cuda.empty_cache()
                     break
                 raise
-        
-        print(f"{'='*60}\n")
-        return results
+        print()
 
 
-# Quick helpers for notebook
-def quick_bench(model='tiny', folder='test_images/', checkpoint=None):
-    """One-liner benchmark"""
-    bench = PiDiNetBenchmarker(model, 'fp16', checkpoint)
-    return bench.benchmark_folder(folder)
+# Quick functions
+def bench(model='tiny', folder='test_images/', ckpt=None):
+    b = PiDiNetBenchmarker(model, 'fp16', ckpt)
+    return b.benchmark_folder(folder)
+
+def stress(model='tiny', image='test.jpg', ckpt=None):
+    b = PiDiNetBenchmarker(model, 'fp16', ckpt)
+    return b.stress_test(image)
 
 
-def quick_stress(model='tiny', image='test.jpg', checkpoint=None):
-    """One-liner stress test"""
-    bench = PiDiNetBenchmarker(model, 'fp16', checkpoint)
-    return bench.stress_test(image)
-
-
-# CLI
 if __name__ == "__main__":
     import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument('--model', default='tiny', choices=['tiny', 'small', 'full'])
+    p.add_argument('--precision', default='fp16', choices=['fp32', 'fp16'])
+    p.add_argument('--mode', default='folder', choices=['folder', 'stress'])
+    p.add_argument('--input', required=True)
+    p.add_argument('--checkpoint', default=None)
+    p.add_argument('--warmup', type=int, default=20)
+    p.add_argument('--iters', type=int, default=100)
+    args = p.parse_args()
     
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model', default='tiny', choices=['tiny', 'small', 'full'])
-    parser.add_argument('--precision', default='fp16', choices=['fp32', 'fp16'])
-    parser.add_argument('--mode', default='folder', choices=['folder', 'stress'])
-    parser.add_argument('--input', required=True, help='Folder or image path')
-    parser.add_argument('--checkpoint', default=None)
-    parser.add_argument('--warmup', type=int, default=20)
-    parser.add_argument('--iters', type=int, default=100)
-    
-    args = parser.parse_args()
-    
-    bench = PiDiNetBenchmarker(args.model, args.precision, args.checkpoint)
+    b = PiDiNetBenchmarker(args.model, args.precision, args.checkpoint)
     
     if args.mode == 'folder':
-        bench.benchmark_folder(args.input, args.warmup, args.iters)
+        b.benchmark_folder(args.input, args.warmup, args.iters)
     else:
-        bench.stress_test(args.input)
+        b.stress_test(args.input)
