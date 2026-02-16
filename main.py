@@ -26,6 +26,9 @@ import torchvision
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
+import scipy.io as sio
+from PIL import Image
+import numpy as np
 
 parser = argparse.ArgumentParser(description='PyTorch Pixel Difference Convolutional Networks')
 
@@ -313,99 +316,50 @@ def train(train_loader, model, optimizer, epoch, running_file, args, running_lr)
 
 
 def test(test_loader, model, epoch, running_file, args):
-
-    from PIL import Image
-    import scipy.io as sio
-    import numpy as np
     model.eval()
 
     if args.ablation:
-        img_dir = os.path.join(args.savedir, 'eval_results_val', 'imgs_epoch_%03d' % (epoch - 1))
         mat_dir = os.path.join(args.savedir, 'eval_results_val', 'mats_epoch_%03d' % (epoch - 1))
     else:
-        img_dir = os.path.join(args.savedir, 'eval_results', 'imgs_epoch_%03d' % (epoch - 1))
         mat_dir = os.path.join(args.savedir, 'eval_results', 'mats_epoch_%03d' % (epoch - 1))
-    eval_info = '\nBegin to eval...\nImg generated in %s\n' % img_dir
+    
+    eval_info = '\nBegin to eval...\nMAT files generated in %s\n' % mat_dir
     print(eval_info)
     running_file.write('\n%s\n%s\n' % (str(args), eval_info))
-    if not os.path.exists(img_dir):
-        os.makedirs(img_dir)
-    else:
-        print('%s already exits' % img_dir)
-        #return
+
     if not os.path.exists(mat_dir):
         os.makedirs(mat_dir)
 
     for idx, (image, img_name) in enumerate(test_loader):
-
         img_name = img_name[0]
         with torch.no_grad():
             image = image.cuda() if args.use_cuda else image
-            _, _, H, W = image.shape
             results = model(image)
+            # Take the last fused result
             result = torch.squeeze(results[-1]).cpu().numpy()
 
-        results_all = torch.zeros((len(results), 1, H, W))
-        for i in range(len(results)):
-            results_all[i, 0, :, :] = results[i]
+        # Save ONLY 'img' key in MAT file
+        sio.savemat(os.path.join(mat_dir, '%s.mat' % img_name), {'img': result})
 
-        torchvision.utils.save_image(1 - results_all,
-                os.path.join(img_dir, "%s.jpg" % img_name))
-
-        # =======================
-        # MAT saving (modified):
-        # save 'img' + all intermediate outputs as out_1..out_n
-        # =======================
-        mat_dict = {'img': result}
-
-        # robust flattening for different possible output types
-        if isinstance(results, (list, tuple)):
-            flat_results = list(results)
-        elif isinstance(results, dict):
-            flat_results = [results[k] for k in sorted(results.keys())]
-        else:
-            flat_results = [results]
-
-        for i, r in enumerate(flat_results, start=1):
-            if hasattr(r, "detach"):
-                r = r.detach()
-            if hasattr(r, "cpu"):
-                r = r.cpu()
-            r_np = r.numpy()
-            r_np = np.squeeze(r_np)
-            mat_dict[f'out_{i}'] = r_np
-
-        sio.savemat(os.path.join(mat_dir, '%s.mat' % img_name), mat_dict)
-        # =======================
-
-        result_img = Image.fromarray((result * 255).astype(np.uint8))
-        result_img.save(os.path.join(img_dir, "%s.png" % img_name))
         runinfo = "Running test [%d/%d]" % (idx + 1, len(test_loader))
         print(runinfo)
         running_file.write('%s\n' % runinfo)
+    
     running_file.write('\nDone\n')
 
 
 def multiscale_test(test_loader, model, epoch, running_file, args):
-
-    from PIL import Image
-    import scipy.io as sio
     model.eval()
 
     if args.ablation:
-        img_dir = os.path.join(args.savedir, 'eval_results_val', 'imgs_epoch_%03d_ms' % (epoch - 1))
         mat_dir = os.path.join(args.savedir, 'eval_results_val', 'mats_epoch_%03d_ms' % (epoch - 1))
     else:
-        img_dir = os.path.join(args.savedir, 'eval_results', 'imgs_epoch_%03d_ms' % (epoch - 1))
         mat_dir = os.path.join(args.savedir, 'eval_results', 'mats_epoch_%03d_ms' % (epoch - 1))
-    eval_info = '\nBegin to eval...\nImg generated in %s\n' % img_dir
+    
+    eval_info = '\nBegin to eval...\nMAT files generated in %s\n' % mat_dir
     print(eval_info)
     running_file.write('\n%s\n%s\n' % (str(args), eval_info))
-    if not os.path.exists(img_dir):
-        os.makedirs(img_dir)
-    else:
-        print('%s already exits' % img_dir)
-        return
+    
     if not os.path.exists(mat_dir):
         os.makedirs(mat_dir)
 
@@ -428,19 +382,20 @@ def multiscale_test(test_loader, model, epoch, running_file, args):
                 multi_fuse += fuse
             multi_fuse = multi_fuse / len(scale)
 
+        # Save ONLY 'img' key in MAT file
         sio.savemat(os.path.join(mat_dir, '%s.mat' % img_name), {'img': multi_fuse})
-        result = Image.fromarray((multi_fuse * 255).astype(np.uint8))
-        result.save(os.path.join(img_dir, "%s.png" % img_name))
+        
         runinfo = "Running test [%d/%d]" % (idx + 1, len(test_loader))
         print(runinfo)
         running_file.write('%s\n' % runinfo)
+    
     running_file.write('\nDone\n')
 
 
 if __name__ == '__main__':
     os.makedirs(args.savedir, exist_ok=True)
-    running_file = os.path.join(args.savedir, '%s_running-%s.txt' \
+    running_file_path = os.path.join(args.savedir, '%s_running-%s.txt' \
             % (args.model, time.strftime('%Y-%m-%d-%H-%M-%S')))
-    with open(running_file, 'w') as f:
+    with open(running_file_path, 'w') as f:
         main(f)
     print('done')
