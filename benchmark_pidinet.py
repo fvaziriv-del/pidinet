@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import time
 import os
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 import glob
 import platform
 import argparse
