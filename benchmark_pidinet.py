@@ -4,6 +4,7 @@ import time
 import os
 import glob
 import platform
+import argparse
 import numpy as np
 from datetime import datetime
 from PIL import Image
@@ -30,7 +31,7 @@ class PiDiNetBenchmarker:
         sa = True if model_type == 'full' else False
         dil = True if model_type == 'full' else False
         
-        # Build raw model
+        # Initialize model
         raw_model = pidinet(config=config, sa=sa, dil=dil)
         
         # Load weights
@@ -39,7 +40,7 @@ class PiDiNetBenchmarker:
             state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
             raw_model.load_state_dict(state_dict)
         
-        # Optimization: Convert to Vanilla Convolution
+        # Convert to optimized Vanilla Convolution
         if use_converted:
             self.model = convert_pidinet(raw_model, config)
         else:
@@ -68,10 +69,8 @@ class PiDiNetBenchmarker:
         exts = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
         files = []
         for e in exts: files.extend(glob.glob(os.path.join(folder_path, e)))
-        
         if not files: raise FileNotFoundError(f"No images found in {folder_path}")
             
-        # Pre-load to RAM to isolate I/O
         tensors = []
         res_list = []
         for f in files:
@@ -82,8 +81,6 @@ class PiDiNetBenchmarker:
             tensors.append(t)
             
         data_pool = cycle(tensors)
-        
-        # Warm-up
         with torch.no_grad():
             for _ in range(warmup_iters):
                 _ = self.model(next(data_pool).to(self.device))
@@ -91,7 +88,6 @@ class PiDiNetBenchmarker:
         torch.cuda.synchronize()
         starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         timings = []
-        
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         mem_init = torch.cuda.memory_allocated() / 1024**2
@@ -105,62 +101,39 @@ class PiDiNetBenchmarker:
                 torch.cuda.synchronize()
                 timings.append(starter.elapsed_time(ender))
 
-        # Stats calculation
         avg_lat = np.mean(timings)
         fps = 1000 / avg_lat
         peak_vram = torch.cuda.max_memory_allocated() / 1024**2
-        avg_w = int(np.mean([r[0] for r in res_list]))
-        avg_h = int(np.mean([r[1] for r in res_list]))
+        avg_w, avg_h = int(np.mean([r[0] for r in res_list])), int(np.mean([r[1] for r in res_list]))
         
         hw = self._get_hw_info()
         report = (
             f"{'='*60}\n              FOLDER INFERENCE BENCHMARK\n{'='*60}\n"
-            f"[SYSTEM]\nDate: {datetime.now()}\nGPU: {hw['gpu']}\nCUDA: {hw['cuda']}\n\n"
-            f"[MODEL]\nArch: PiDiNet ({self.model_type})\nConverted: {self.use_converted}\n"
-            f"Precision: {self.precision.upper()}\nParams: {self.total_params:,}\n\n"
-            f"[CONFIG]\nAvg Res: {avg_w}x{avg_h}\nIters: {test_iters}\n\n"
-            f"[METRICS]\nAvg Latency: {avg_lat:.3f} ms\nFPS: {fps:.2f}\nPeak VRAM: {peak_vram:.2f} MB\n"
+            f"[SYSTEM]  Date: {datetime.now()} | GPU: {hw['gpu']}\n"
+            f"[MODEL]   Arch: PiDiNet ({self.model_type}) | Precision: {self.precision.upper()}\n"
+            f"[METRICS] Avg Res: {avg_w}x{avg_h} | Latency: {avg_lat:.3f} ms | FPS: {fps:.2f} | VRAM: {peak_vram:.2f} MB\n"
             f"{'='*60}\n"
         )
         print(report)
         if save_log:
-            with open(os.path.join(folder_path, f"bench_{self.precision}.txt"), 'w') as f: f.write(report)
+            with open(f"bench_folder_{self.model_type}_{self.precision}.txt", 'w') as f: f.write(report)
 
     def run_stress_test(self, image_path, save_log=True):
-        resolutions = [1024, 2048, 4096, 8192] # 1k, 2k, 4k, 8k
+        resolutions = [1024, 2048, 4096, 8192]
         img = Image.open(image_path).convert('RGB')
         hw = self._get_hw_info()
+        print(f"\nSTRESS TEST: {self.model_type.upper()} | Precision: {self.precision.upper()} | GPU: {hw['gpu']}")
         
-        report = [
-            f"{'='*60}",
-            f"           PIDINET ARCHITECTURE STRESS TEST",
-            f"{'='*60}",
-            f"[SYSTEM INFO]",
-            f"Hardware:  {hw['gpu']}",
-            f"Precision: {self.precision.upper()}",
-            f"Model:     {self.model_type}\n",
-            f"[STRESS TEST PROGRESS]",
-            f"{'-'*60}"
-        ]
-        
-        print("\n".join(report))
         log_entries = []
-        
         for side in resolutions:
             try:
-                # Prepare synthetic high-res input
                 img_resized = img.resize((side, side))
                 t = self.transform(img_resized).unsqueeze(0).to(self.device)
                 if self.precision == 'fp16': t = t.half()
-                
-                # Warm-up
                 with torch.no_grad():
                     for _ in range(5): _ = self.model(t)
-                
                 torch.cuda.synchronize()
                 starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                
-                # Inference test
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats()
                 
@@ -175,34 +148,43 @@ class PiDiNetBenchmarker:
                 
                 avg_ms = np.mean(latencies)
                 vram = torch.cuda.max_memory_allocated() / 1024**2
-                status = f"STEP: {side}x{side} | Latency: {avg_ms:.2f} ms | VRAM: {vram:.2f} MB | PASSED ✅"
+                status = f"RES: {side}x{side} | Latency: {avg_ms:.2f} ms | VRAM: {vram:.2f} MB | STATUS: PASSED"
                 print(status)
                 log_entries.append(status)
-                del t, img_resized
-                
+                del t
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
-                    status = f"STEP: {side}x{side} | FAILED ❌ (CUDA Out of Memory)"
+                    status = f"RES: {side}x{side} | STATUS: FAILED (CUDA Out of Memory)"
                     print(status)
                     log_entries.append(status)
                     torch.cuda.empty_cache()
                     break
                 else: raise e
 
-        final_report = "\n".join(report) + "\n" + "\n".join(log_entries) + f"\n{'-'*60}\nBenchmark Finished.\n"
         if save_log:
-            with open(f"stress_test_{self.model_type}_{self.precision}.txt", 'w') as f: f.write(final_report)
+            with open(f"stress_{self.model_type}_{self.precision}.txt", 'w') as f:
+                f.write("\n".join(log_entries))
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="PiDiNet Performance Benchmarking Tool")
+    parser.add_argument('--model', type=str, default='tiny', choices=['tiny', 'full'], help="Model variant")
+    parser.add_argument('--precision', type=str, default='fp16', choices=['fp16', 'fp32'], help="Floating point precision")
+    parser.add_argument('--mode', type=str, default='stress', choices=['stress', 'folder'], help="Benchmark mode")
+    parser.add_argument('--input', type=str, required=True, help="Path to image (stress) or folder (folder)")
+    parser.add_argument('--checkpoint', type=str, help="Path to .pth checkpoint")
+    parser.add_argument('--warmup', type=int, default=20, help="Number of warmup iterations")
+    parser.add_argument('--iters', type=int, default=100, help="Number of test iterations")
+
+    args = parser.parse_args()
+
     bench = PiDiNetBenchmarker(
-        model_type='tiny', 
-        precision='fp16', 
+        model_type=args.model, 
+        precision=args.precision, 
         use_converted=True,
-        checkpoint_path='./checkpoints/table5_pidinet-tiny.pth'
+        checkpoint_path=args.checkpoint
     )
     
-    # 1. Folder Benchmark
-    # bench.run_folder_benchmark('./benchmark_images', warmup_iters=20, test_iters=100)
-    
-    # 2. Stress Test
-    bench.run_stress_test('sample_input.jpg')
+    if args.mode == 'stress':
+        bench.run_stress_test(args.input)
+    else:
+        bench.run_folder_benchmark(args.input, warmup_iters=args.warmup, test_iters=args.iters)
